@@ -1,24 +1,22 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
-langchain-huggingface==0.1.2
-langchain-core==0.3.28
-huggingface-hub==0.27.0
 python-dotenv==1.0.1
 
-# --- ONNX backend (only needed if EMBEDDINGS_BACKEND=onnx) ---
-# CPU-only torch wheel: much smaller than the default CUDA build and all
-# that's needed for CPU-based ONNX inference/export on Railway.
+llama-index-core==0.12.10
+llama-index-embeddings-huggingface==0.4.0
+
+# sentence-transformers>=3.2 is required for backend="onnx"/"openvino" support
+sentence-transformers==3.3.1
+
+# CPU-only torch wheel — Railway has no GPU, and sentence-transformers still
+# imports torch even when the actual embedding inference runs via ONNX Runtime.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.5.1
-optimum[onnxruntime]==1.23.3
-onnx==1.17.0
-numpy==1.26.4
 
-# Pick ONE of the next two lines depending on ONNX_DEVICE:
+# ONNX Runtime CPU build + Optimum, used internally by the sentence-transformers
+# "onnx" backend. If deploying on a GPU host instead, swap this line for
+# onnxruntime-gpu and set DEVICE=cuda / ONNX_PROVIDER=CUDAExecutionProvider
+# in your environment (see README "Running with a GPU").
+optimum[onnxruntime]==1.23.3
 onnxruntime==1.20.1
-# onnxruntime-gpu==1.20.1   # use this instead (and remove the CPU line above)
-                            # if ONNX_DEVICE=cuda / ONNX_PROVIDER=CUDAExecutionProvider.
-                            # Requires a GPU-enabled Railway plan/runtime with
-                            # matching CUDA/cuDNN available; onnxruntime and
-                            # onnxruntime-gpu cannot both be installed at once.
