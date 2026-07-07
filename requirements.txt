@@ -1,0 +1,24 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+langchain-huggingface==0.1.2
+langchain-core==0.3.28
+huggingface-hub==0.27.0
+python-dotenv==1.0.1
+
+# --- ONNX backend (only needed if EMBEDDINGS_BACKEND=onnx) ---
+# CPU-only torch wheel: much smaller than the default CUDA build and all
+# that's needed for CPU-based ONNX inference/export on Railway.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+optimum[onnxruntime]==1.23.3
+onnx==1.17.0
+numpy==1.26.4
+
+# Pick ONE of the next two lines depending on ONNX_DEVICE:
+onnxruntime==1.20.1
+# onnxruntime-gpu==1.20.1   # use this instead (and remove the CPU line above)
+                            # if ONNX_DEVICE=cuda / ONNX_PROVIDER=CUDAExecutionProvider.
+                            # Requires a GPU-enabled Railway plan/runtime with
+                            # matching CUDA/cuDNN available; onnxruntime and
+                            # onnxruntime-gpu cannot both be installed at once.
