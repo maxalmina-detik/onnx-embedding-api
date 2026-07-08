@@ -1,20 +1,19 @@
-# LlamaIndex ONNX Embeddings Service (Railway-ready)
+# ONNX Embeddings Service (Railway-ready)
 
-A minimal FastAPI service that wraps LlamaIndex's `HuggingFaceEmbedding`,
-configured to use the sentence-transformers **ONNX backend** (Optimum + ONNX
-Runtime) — turning this into a callable HTTP API instead of an in-notebook
-object:
+A minimal FastAPI service that runs local embedding inference directly
+through **ONNX Runtime** — no torch, sentence-transformers, optimum, or
+llama-index in the request path (see `onnx_embeddings.py`). That stack is
+skipped on purpose to keep the container's resident RAM small: torch alone
+adds a few hundred MB just from being imported, which matters on Railway's
+smaller instance tiers.
 
 ```python
-embed_model = HuggingFaceEmbedding(
-    model_name="onnx-community/embeddinggemma-300m-ONNX",
-    device="cuda",
-    backend="onnx",
-    embed_batch_size=8,
-    model_kwargs={
-        "file_name": "model_quantized.onnx",
-        "provider": "CUDAExecutionProvider",
-    },
+embeddings = ONNXEmbeddings(
+    model_id="onnx-community/embeddinggemma-300m-ONNX",
+    device="cpu",
+    onnx_file_name="model_quantized.onnx",
+    provider="CPUExecutionProvider",
+    batch_size=8,
     query_instruction="task: search result | query: ",
 )
 ```
@@ -33,15 +32,14 @@ RunPod, Fly.io GPU, Northflank BYOC, etc.) you just flip `DEVICE=cuda`,
 
 ## Endpoints
 
-- `GET /health` — check the service is up and see the active model/backend/device
+- `GET /health` — check the service is up and see the active model/device/provider
 - `POST /embed/query` — embed a single query string. **`query_instruction` is
-  applied automatically** (this uses `get_query_embedding`, matching how your
-  original `embed_model` distinguishes queries from documents).
+  applied automatically**, distinguishing queries from documents.
   ```json
   { "text": "berapa harga bbm hari ini" }
   ```
-- `POST /embed/documents` — embed a batch of chunks (`get_text_embedding_batch`,
-  respects `EMBED_BATCH_SIZE` internally).
+- `POST /embed/documents` — embed a batch of chunks, respecting
+  `EMBED_BATCH_SIZE` internally.
   ```json
   { "texts": ["chunk 1 ...", "chunk 2 ..."] }
   ```
@@ -93,7 +91,6 @@ via CLI) — the defaults in `.env.example` already match your snippet aside
 from device/provider:
 ```bash
 railway variables --set "MODEL_NAME=onnx-community/embeddinggemma-300m-ONNX" \
-                   --set "BACKEND=onnx" \
                    --set "DEVICE=cpu" \
                    --set "ONNX_FILE_NAME=model_quantized.onnx" \
                    --set "ONNX_PROVIDER=CPUExecutionProvider" \
@@ -105,9 +102,31 @@ Railway provides `$PORT` automatically; the start command in `railway.json`
 and `Procfile` already binds to it. The healthcheck timeout is set to 180s to
 allow for the model download on first boot.
 
-**Resource sizing:** embeddinggemma-300m is small, but this container still
-loads torch + onnxruntime + the model and runs real inference — give it at
-least 2 vCPU / 2GB RAM on Railway and load-test from there.
+**Resource sizing:** embeddinggemma-300m is small and this container no
+longer loads torch — just `transformers` (tokenizer only), `onnxruntime`, and
+the quantized ONNX weights (~300MB). 512MB–1GB RAM should comfortably fit the
+model plus a request or two in flight; size up from there if you raise
+`EMBED_BATCH_SIZE` or run many requests concurrently.
+
+### Persisting the model across deploys (Railway volumes)
+
+By default the ONNX weights + tokenizer are downloaded from the Hub into the
+Hugging Face cache (`~/.cache/huggingface`) on every fresh boot, since
+Railway's filesystem is ephemeral. To avoid re-downloading ~300MB on every
+deploy/restart (which briefly spikes memory and CPU right as the healthcheck
+is waiting on you):
+
+1. Railway dashboard → your service → **Volumes** → add a volume, mount path
+   e.g. `/data`.
+2. Set `HF_HOME=/data/hf-cache` as an environment variable (this is the
+   standard `huggingface_hub` cache-location variable — no code changes
+   needed, `AutoTokenizer`/`hf_hub_download` both honor it automatically).
+3. Redeploy. The first boot after attaching the volume still downloads the
+   model once; every boot after that reuses the cached files from the volume.
+
+Note volumes only attach to a single service replica, so this doesn't help if
+you're running multiple replicas of this service — each would need its own
+volume (or you skip this and accept the download on every cold start).
 
 ## 3. Calling it from other code
 
@@ -141,17 +160,13 @@ ONNX_PROVIDER=CUDAExecutionProvider
 ```
 and in `requirements.txt`, replace:
 ```
-optimum[onnxruntime]==1.23.3
 onnxruntime==1.20.1
 ```
 with:
 ```
-optimum[onnxruntime-gpu]==1.23.3
 onnxruntime-gpu==1.20.1
 ```
-(and use a CUDA-enabled base image/torch build appropriate to the host's
-driver version — the CPU-only `--extra-index-url` line in `requirements.txt`
-should be removed in that case).
+(and use a CUDA-enabled base image appropriate to the host's driver version).
 
 ## Notes
 
@@ -159,5 +174,13 @@ should be removed in that case).
   expects a different prefix for indexed documents vs. queries — set
   `TEXT_INSTRUCTION` if needed (left unset by default, matching your snippet).
 - `onnx-community/*` models ship pre-exported ONNX weights, so there's no
-  on-the-fly conversion step here — sentence-transformers just downloads and
-  loads `model_quantized.onnx` directly, keeping cold starts predictable.
+  on-the-fly conversion step here — `onnx_embeddings.py` downloads
+  `onnx/model_quantized.onnx` (+ its external-data sibling file, if present)
+  straight from the Hub and runs it directly via `onnxruntime.InferenceSession`.
+- If the ONNX graph exposes a `sentence_embedding` output (as
+  embeddinggemma-300m-ONNX does), it's used directly instead of manually
+  mean-pooling `last_hidden_state`.
+- `ORT_INTRA_OP_THREADS` / `ORT_INTER_OP_THREADS` (default `1` each) cap ONNX
+  Runtime's thread pools — kept low by default to favor a small memory
+  footprint over max throughput on Railway's smaller instance tiers; raise
+  them if you have CPU headroom and want more throughput.

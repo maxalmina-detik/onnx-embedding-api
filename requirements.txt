@@ -3,29 +3,21 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 python-dotenv==1.0.1
 
-llama-index-core==0.12.10
-llama-index-embeddings-huggingface==0.4.0
-
-# sentence-transformers>=3.2 is required for backend="onnx"/"openvino" support
-sentence-transformers==3.3.1
-
-# transformers==4.46.3 (pulled in transitively) doesn't recognize the
-# "gemma3_text" architecture used by onnx-community/embeddinggemma-300m-ONNX,
-# which raises a ValueError during model loading and crashes the app before
-# it can bind to $PORT — Railway's healthcheck then times out waiting for a
-# server that never started. transformers>=4.50.0 adds gemma3_text support.
-# Upper-bounded to stay inside optimum[onnxruntime]==1.26.1's supported range
-# (see the optimum pin below) — bump both together if you upgrade either.
+# AutoTokenizer only -- no torch/tensorflow needed as long as the model ships
+# a fast (Rust-backed) tokenizer, which embeddinggemma-300m-ONNX does
+# (tokenizer.json present). transformers<4.50 doesn't recognize the
+# "gemma3_text" architecture used by this model and raises a ValueError
+# during tokenizer/config loading, crashing the app before it can bind to
+# $PORT -- Railway's healthcheck then times out waiting for a server that
+# never started.
 transformers>=4.50.0,<4.53.0
+huggingface_hub==0.27.1
 
-# CPU-only torch wheel — Railway has no GPU, and sentence-transformers still
-# imports torch even when the actual embedding inference runs via ONNX Runtime.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1
-
-# ONNX Runtime CPU build + Optimum, used internally by the sentence-transformers
-# "onnx" backend. If deploying on a GPU host instead, swap this line for
-# onnxruntime-gpu and set DEVICE=cuda / ONNX_PROVIDER=CUDAExecutionProvider
-# in your environment (see README "Running with a GPU").
-optimum[onnxruntime]==1.26.1
+# Plain ONNX Runtime, called directly (see onnx_embeddings.py) instead of
+# through sentence-transformers/optimum -- skips pulling in torch, which
+# alone adds a few hundred MB of resident RAM on a container that only ever
+# runs inference through ONNX Runtime anyway. If deploying on a GPU host
+# instead, swap this line for onnxruntime-gpu and set DEVICE=cuda /
+# ONNX_PROVIDER=CUDAExecutionProvider in your environment (see README
+# "Running with a GPU").
 onnxruntime==1.20.1

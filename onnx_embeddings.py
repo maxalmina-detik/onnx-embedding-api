@@ -1,30 +1,18 @@
 """
-A LangChain-compatible Embeddings class that runs an ONNX embedding model
-locally via Hugging Face Optimum + ONNX Runtime, instead of calling a remote
-HF Inference Endpoint.
+A minimal embeddings class that runs an ONNX embedding model locally via
+plain ONNX Runtime + a fast tokenizer -- no torch, sentence-transformers, or
+optimum in the loop.
 
-This mirrors the shape of LlamaIndex's `HuggingFaceEmbedding(..., backend="onnx")`
-config, e.g.:
+That stack is skipped on purpose: torch alone adds a few hundred MB of
+resident RAM just from being imported, which matters on small Railway
+instances where inference itself runs entirely through ONNX Runtime anyway.
+transformers' AutoTokenizer does not require torch as long as a fast
+(Rust-backed) tokenizer is available for the model, which is the case for
+onnx-community/embeddinggemma-300m-ONNX.
 
-    # LlamaIndex
-    embed_model = HuggingFaceEmbedding(
-        model_name="onnx-community/embeddinggemma-300m-ONNX",
-        device="cuda",
-        backend="onnx",
-        embed_batch_size=8,
-        model_kwargs={
-            "file_name": "model_quantized.onnx",
-            "provider": "CUDAExecutionProvider",
-        },
-        query_instruction="task: search result | query: ",
-    )
-
-    # LangChain equivalent (this class)
     embeddings = ONNXEmbeddings(
         model_id="onnx-community/embeddinggemma-300m-ONNX",
-        device="cuda",
         onnx_file_name="model_quantized.onnx",
-        batch_size=8,
         query_instruction="task: search result | query: ",
     )
 
@@ -33,18 +21,22 @@ Notes:
     ("cuda" -> CUDAExecutionProvider, "cpu" -> CPUExecutionProvider). Pass
     `provider=` directly if you need a specific provider (e.g. TensorrtExecutionProvider).
   - GPU inference (CUDAExecutionProvider) requires the `onnxruntime-gpu`
-    package instead of plain `onnxruntime` — see requirements.txt.
+    package instead of plain `onnxruntime` -- see requirements.txt.
   - `query_instruction` / `text_instruction` prepend a task prefix before
     embedding, matching how asymmetric-retrieval models like EmbeddingGemma
     and BGE are meant to be used (different prefix for queries vs. documents).
+  - If the ONNX graph exposes a `sentence_embedding` output (as
+    embeddinggemma-300m-ONNX does), that's used directly instead of manually
+    mean-pooling `last_hidden_state`.
 """
 
 import logging
+import os
 from typing import List, Optional
 
 import numpy as np
-from langchain_core.embeddings import Embeddings
-from optimum.onnxruntime import ORTModelForFeatureExtraction
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 
 logger = logging.getLogger("onnx-embeddings")
@@ -56,19 +48,14 @@ _DEVICE_TO_PROVIDER = {
 }
 
 
-class ONNXEmbeddings(Embeddings):
-    """Mean-pooled sentence embeddings from a local ONNX model.
-
-    Implements the same embed_query / embed_documents interface as
-    LangChain's other Embeddings classes (e.g. HuggingFaceEndpointEmbeddings),
-    so it's a drop-in swap in this service or any other LangChain code.
-    """
+class ONNXEmbeddings:
+    """Mean-pooled (or model-provided) sentence embeddings from a local ONNX model."""
 
     def __init__(
         self,
         model_id: str,
-        onnx_file_name: Optional[str] = None,
-        export: bool = False,
+        onnx_file_name: str = "model_quantized.onnx",
+        onnx_subfolder: str = "onnx",
         device: str = "cpu",
         provider: Optional[str] = None,
         max_length: int = 512,
@@ -76,6 +63,8 @@ class ONNXEmbeddings(Embeddings):
         batch_size: int = 32,
         query_instruction: str = "",
         text_instruction: str = "",
+        intra_op_num_threads: Optional[int] = None,
+        inter_op_num_threads: Optional[int] = None,
     ):
         self.model_id = model_id
         self.max_length = max_length
@@ -89,26 +78,44 @@ class ONNXEmbeddings(Embeddings):
         )
 
         logger.info(
-            "Loading ONNX embeddings model=%s export=%s onnx_file_name=%s provider=%s",
-            model_id, export, onnx_file_name, resolved_provider,
+            "Loading ONNX embeddings model=%s onnx_file_name=%s provider=%s",
+            model_id, onnx_file_name, resolved_provider,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-        load_kwargs = {}
-        if onnx_file_name:
-            load_kwargs["file_name"] = onnx_file_name
-
-        # export=True converts a regular HF checkpoint to ONNX on the fly
-        # (and caches it under the HF cache dir for the life of the container).
-        # export=False (default) expects the repo/path to already contain ONNX
-        # weights, e.g. onnx-community/embeddinggemma-300m-ONNX.
-        self.model = ORTModelForFeatureExtraction.from_pretrained(
-            model_id,
-            export=export,
-            provider=resolved_provider,
-            **load_kwargs,
+        onnx_path = hf_hub_download(
+            repo_id=model_id, filename=f"{onnx_subfolder}/{onnx_file_name}"
         )
+        # Models that use the ONNX external-data format split large weight
+        # tensors into a sibling "<file>_data" blob that must sit next to the
+        # .onnx graph on disk -- pull it down too when the repo has one.
+        try:
+            hf_hub_download(
+                repo_id=model_id, filename=f"{onnx_subfolder}/{onnx_file_name}_data"
+            )
+        except Exception:
+            pass
+
+        sess_options = ort.SessionOptions()
+        # Trade a bit of latency for a smaller resident memory footprint --
+        # the default arena/thread settings are tuned for throughput, not
+        # RAM, and Railway's small instances are memory- not CPU-constrained.
+        sess_options.enable_cpu_mem_arena = False
+        sess_options.enable_mem_pattern = False
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.intra_op_num_threads = intra_op_num_threads or int(
+            os.getenv("ORT_INTRA_OP_THREADS", "1")
+        )
+        sess_options.inter_op_num_threads = inter_op_num_threads or int(
+            os.getenv("ORT_INTER_OP_THREADS", "1")
+        )
+
+        self.session = ort.InferenceSession(
+            onnx_path, sess_options=sess_options, providers=[resolved_provider]
+        )
+        self._output_names = [o.name for o in self.session.get_outputs()]
+        self._input_names = {i.name for i in self.session.get_inputs()}
 
         logger.info("ONNX embeddings model ready: %s (provider=%s)", model_id, resolved_provider)
 
@@ -120,24 +127,20 @@ class ONNXEmbeddings(Embeddings):
         return summed / counts
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        inputs = self.tokenizer(
+        encoded = self.tokenizer(
             texts,
             padding=True,
             truncation=True,
             max_length=self.max_length,
-            return_tensors="pt",
+            return_tensors="np",
         )
-        outputs = self.model(**inputs)
+        feed = {name: encoded[name] for name in encoded if name in self._input_names}
+        outputs = dict(zip(self._output_names, self.session.run(self._output_names, feed)))
 
         if "sentence_embedding" in outputs:
-            # Model exposes a pre-pooled sentence embedding output (e.g.
-            # embeddinggemma-300m-ONNX) -- use it directly instead of
-            # mean-pooling last_hidden_state ourselves.
-            pooled = outputs["sentence_embedding"].detach().cpu().numpy()
+            pooled = outputs["sentence_embedding"]
         else:
-            last_hidden = outputs.last_hidden_state.detach().cpu().numpy()
-            attention_mask = inputs["attention_mask"].detach().cpu().numpy()
-            pooled = self._mean_pool(last_hidden, attention_mask)
+            pooled = self._mean_pool(outputs["last_hidden_state"], encoded["attention_mask"])
 
         if self.normalize:
             norms = np.linalg.norm(pooled, axis=1, keepdims=True)
@@ -149,8 +152,7 @@ class ONNXEmbeddings(Embeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Embed a batch of documents/chunks, in batch_size-sized groups.
 
-        Applies `text_instruction` as a prefix to each text, mirroring
-        LlamaIndex's document-side instruction handling.
+        Applies `text_instruction` as a prefix to each text.
         """
         if not texts:
             return []
