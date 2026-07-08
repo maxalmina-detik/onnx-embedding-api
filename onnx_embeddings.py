@@ -129,10 +129,15 @@ class ONNXEmbeddings(Embeddings):
         )
         outputs = self.model(**inputs)
 
-        last_hidden = outputs.last_hidden_state.detach().cpu().numpy()
-        attention_mask = inputs["attention_mask"].detach().cpu().numpy()
-
-        pooled = self._mean_pool(last_hidden, attention_mask)
+        if "sentence_embedding" in outputs:
+            # Model exposes a pre-pooled sentence embedding output (e.g.
+            # embeddinggemma-300m-ONNX) -- use it directly instead of
+            # mean-pooling last_hidden_state ourselves.
+            pooled = outputs["sentence_embedding"].detach().cpu().numpy()
+        else:
+            last_hidden = outputs.last_hidden_state.detach().cpu().numpy()
+            attention_mask = inputs["attention_mask"].detach().cpu().numpy()
+            pooled = self._mean_pool(last_hidden, attention_mask)
 
         if self.normalize:
             norms = np.linalg.norm(pooled, axis=1, keepdims=True)
